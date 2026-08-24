@@ -797,6 +797,9 @@ panfrost_should_checksum(const struct panfrost_device *dev,
    unsigned bytes_per_pixel = MAX2(pres->base.nr_samples, 1) *
                               util_format_get_blocksize(pres->base.format);
 
+   if (dev->model->quirks.no_crc)
+      return false;
+
    return pres->base.bind & PIPE_BIND_RENDER_TARGET && panfrost_is_2d(pres) &&
           bytes_per_pixel <= bytes_per_pixel_max &&
           !(dev->debug & PAN_DBG_NO_CRC);

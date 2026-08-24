@@ -88,6 +88,7 @@ struct pan_model {
        */
       bool no_hierarchical_tiling;
       bool max_4x_msaa;
+      bool no_crc;
    } quirks;
 };
 
