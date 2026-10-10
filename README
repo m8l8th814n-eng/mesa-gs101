@@ -1,9 +1,14 @@
-Patches for Mesa (base: upstream dc330577adb9e98363ef6061e09062f171d0d053, 26.3.0_git20260825).
-Apply in order with patch -p1.
+Everything needed to run PanVK/panfrost on Mali-G78 (Pixel 6, gs101) and Mali-G77.
+Apply each directory in order with patch -p1.
 
-0001  Mali-G78 in the panfrost model table (Pixel 6 / gs101)
-0002  Mali-G77 (0x9000) in the panfrost model table
-0003  Disable transaction elimination on G78 (stale tiles, GPU wedges under a compositor)
-0004  PanVK: Valhall v9 on the JM backend, compute only (no graphics yet)
+kernel/  (Linux 7.2, drivers/gpu/drm/panfrost)
+  0001  Mali-G78 (0x9202, masked 0x9002), errata from Arm tBEx
+  0002  Mali-G77 (0x9000), errata from Arm tTRx (r0p0, r0p1)
 
-The G77 patch is untested on hardware.
+patches/ (Mesa, base: upstream dc330577adb9e98363ef6061e09062f171d0d053, 26.3.0_git20260825)
+  0001  Mali-G78 in the panfrost model table
+  0002  Mali-G77 (0x9000) in the panfrost model table
+  0003  Disable transaction elimination on G78 (stale tiles, GPU wedges under a compositor)
+  0004  PanVK: Valhall v9 on the JM backend, compute only (no graphics yet)
+
+G77 patches are untested on hardware.

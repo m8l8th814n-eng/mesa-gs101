@@ -1,8 +1,5 @@
 Subject: [PATCH] panfrost: Advertise Mali-G77 support
 
-Add Mali-G77 (GPU_PROD_ID 0x9000) to the model table, next to the G57
-variants that already report G77 as their marketing name.
-
 diff --git a/src/panfrost/model/pan_model.c b/src/panfrost/model/pan_model.c
 --- a/src/panfrost/model/pan_model.c
 +++ b/src/panfrost/model/pan_model.c

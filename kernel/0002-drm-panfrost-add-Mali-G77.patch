@@ -1,0 +1,58 @@
+Subject: [PATCH] drm/panfrost: add Mali-G77
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_features.h b/drivers/gpu/drm/panfrost/panfrost_features.h
+--- a/drivers/gpu/drm/panfrost/panfrost_features.h
++++ b/drivers/gpu/drm/panfrost/panfrost_features.h
+@@ -109,6 +109,18 @@
+ 	BIT_ULL(HW_FEATURE_TLS_HASHING) | \
+ 	BIT_ULL(HW_FEATURE_3BIT_EXT_RW_L2_MMU_CONFIG))
+ 
++#define hw_features_g77 (\
++	BIT_ULL(HW_FEATURE_JOBCHAIN_DISAMBIGUATION) | \
++	BIT_ULL(HW_FEATURE_PWRON_DURING_PWROFF_TRANS) | \
++	BIT_ULL(HW_FEATURE_XAFFINITY) | \
++	BIT_ULL(HW_FEATURE_FLUSH_REDUCTION) | \
++	BIT_ULL(HW_FEATURE_PROTECTED_MODE) | \
++	BIT_ULL(HW_FEATURE_PROTECTED_DEBUG_MODE) | \
++	BIT_ULL(HW_FEATURE_COHERENCY_REG) | \
++	BIT_ULL(HW_FEATURE_AARCH64_MMU) | \
++	BIT_ULL(HW_FEATURE_IDVS_GROUP_SIZE) | \
++	BIT_ULL(HW_FEATURE_CLEAN_ONLY_SAFE))
++
+ #define hw_features_g57 (\
+ 	BIT_ULL(HW_FEATURE_JOBCHAIN_DISAMBIGUATION) | \
+ 	BIT_ULL(HW_FEATURE_PWRON_DURING_PWROFF_TRANS) | \
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gpu.c b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+--- a/drivers/gpu/drm/panfrost/panfrost_gpu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+@@ -228,6 +228,9 @@
+ 	GPU_MODEL(g31, 0x7003,
+ 		GPU_REV(g31, 1, 0)),
+ 
++	GPU_MODEL(g77, 0x9000,
++		GPU_REV(g77, 0, 0), GPU_REV(g77, 0, 1)),
++
+ 	GPU_MODEL(g57, 0x9001,
+ 		GPU_REV(g57, 0, 0)),
+ 
+diff --git a/drivers/gpu/drm/panfrost/panfrost_issues.h b/drivers/gpu/drm/panfrost/panfrost_issues.h
+--- a/drivers/gpu/drm/panfrost/panfrost_issues.h
++++ b/drivers/gpu/drm/panfrost/panfrost_issues.h
+@@ -258,6 +258,17 @@
+ 
+ #define hw_issues_g76 0
+ 
++#define hw_issues_g77 (\
++	BIT_ULL(HW_ISSUE_9435) | \
++	BIT_ULL(HW_ISSUE_TTRX_2968_TTRX_3162) | \
++	BIT_ULL(HW_ISSUE_TTRX_3076))
++
++#define hw_issues_g77_r0p0 (\
++	BIT_ULL(HW_ISSUE_TTRX_3485))
++
++#define hw_issues_g77_r0p1 (\
++	BIT_ULL(HW_ISSUE_TTRX_3485))
++
+ #define hw_issues_g57 (\
+ 	BIT_ULL(HW_ISSUE_TTRX_2968_TTRX_3162) | \
+ 	BIT_ULL(HW_ISSUE_TTRX_3076))

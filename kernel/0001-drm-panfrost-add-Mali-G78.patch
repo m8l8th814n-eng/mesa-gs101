@@ -1,0 +1,96 @@
+Subject: [PATCH] drm/panfrost: add Mali-G78 (gs101) support
+
+The Mali-G78 MP20 in Google Tensor (gs101) is not in panfrost's model table.
+panfrost binds, powers up the GPU and reads its ID over MMIO without trouble,
+but the lookup in panfrost_gpu_init_features() falls through and returns
+-ENODEV:
+
+    panfrost 1c500000.gpu: GPU model not found: mali-unknown id rev 0x9202 0x10
+    panfrost 1c500000.gpu: Fatal error during GPU init
+
+Note the ID in that message is the raw value. panfrost_model_cmp() masks any
+ID that has bits set in 0xf000 down to 0xf00f before comparing, so 0x9202 is
+compared as 0x9002 and the table entry must use the masked value. (This is
+also why the existing 0x9093 entry for MT8188 can never match; it masks to
+0x9003, which is already listed separately.)
+
+The feature and issue sets are taken from Arm's kbase for this part (product
+tBEx), not inferred from a neighbouring GPU:
+
+  hw_features_g78 matches g57. Arm's tBEx feature list additionally names
+  L2_CONFIG and FLUSH_INV_SHADER_OTHER, neither of which panfrost implements,
+  so nothing is lost by the two sets being identical today.
+
+  hw_issues_g78 is 9435 and TTRX_2968_TTRX_3162. Of the fourteen errata Arm
+  lists for tBEx r0p1, those are the only two panfrost knows about. Both
+  appear in every tBEx revision list (r0p0, r0p1, r1p0), so no revision
+  specific entries are needed and GPU_MODEL() is used without any GPU_REV().
+
+Reusing the g57 sets was tempting but wrong in both directions: g57 lacks
+9435, which every G78 revision requires, and carries TTRX_3076, which no G78
+revision lists.
+
+The silicon in Pixel 6 reports revision 0x10 (r0p1).
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_features.h b/drivers/gpu/drm/panfrost/panfrost_features.h
+index 52f9d69f6db9..38b8b5b41a52 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_features.h
++++ b/drivers/gpu/drm/panfrost/panfrost_features.h
+@@ -121,6 +121,21 @@ enum panfrost_hw_feature {
+ 	BIT_ULL(HW_FEATURE_IDVS_GROUP_SIZE) | \
+ 	BIT_ULL(HW_FEATURE_CLEAN_ONLY_SAFE))
+ 
++/* Same set as g57. Arm's tBEx feature list additionally names L2_CONFIG and
++ * FLUSH_INV_SHADER_OTHER, neither of which panfrost implements.
++ */
++#define hw_features_g78 (\
++	BIT_ULL(HW_FEATURE_JOBCHAIN_DISAMBIGUATION) | \
++	BIT_ULL(HW_FEATURE_PWRON_DURING_PWROFF_TRANS) | \
++	BIT_ULL(HW_FEATURE_XAFFINITY) | \
++	BIT_ULL(HW_FEATURE_FLUSH_REDUCTION) | \
++	BIT_ULL(HW_FEATURE_PROTECTED_MODE) | \
++	BIT_ULL(HW_FEATURE_PROTECTED_DEBUG_MODE) | \
++	BIT_ULL(HW_FEATURE_COHERENCY_REG) | \
++	BIT_ULL(HW_FEATURE_AARCH64_MMU) | \
++	BIT_ULL(HW_FEATURE_IDVS_GROUP_SIZE) | \
++	BIT_ULL(HW_FEATURE_CLEAN_ONLY_SAFE))
++
+ static inline bool panfrost_has_hw_feature(struct panfrost_device *pfdev,
+ 					   enum panfrost_hw_feature feat)
+ {
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gpu.c b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+index 7d555e63e21a..6a6dc5c06b72 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_gpu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gpu.c
+@@ -242,6 +242,12 @@ static const struct panfrost_model gpu_models[] = {
+ 	/* MediaTek MT8188 Mali-G57 MC3 */
+ 	GPU_MODEL(g57, 0x9093,
+ 		GPU_REV(g57, 0, 0)),
++
++	/* Google Tensor (gs101) Mali-G78 MP20. The GPU reports ID 0x9202, but
++	 * panfrost_model_cmp() masks any ID with bits in 0xf000 down to 0xf00f
++	 * before comparing, so the table entry has to be the masked value.
++	 */
++	GPU_MODEL(g78, 0x9002),
+ 	{0},
+ };
+ 
+diff --git a/drivers/gpu/drm/panfrost/panfrost_issues.h b/drivers/gpu/drm/panfrost/panfrost_issues.h
+index eb60cb83667a..fa302800eda2 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_issues.h
++++ b/drivers/gpu/drm/panfrost/panfrost_issues.h
+@@ -265,6 +265,14 @@ enum panfrost_hw_issue {
+ #define hw_issues_g57_r0p0 (\
+ 	BIT_ULL(HW_ISSUE_TTRX_3485))
+ 
++/* Per Arm's tBEx issue lists, these two apply to every G78 revision (r0p0,
++ * r0p1, r1p0), so no revision-specific entries are needed. Note g57 carries
++ * TTRX_3076, which no G78 revision lists.
++ */
++#define hw_issues_g78 (\
++	BIT_ULL(HW_ISSUE_9435) | \
++	BIT_ULL(HW_ISSUE_TTRX_2968_TTRX_3162))
++
+ static inline bool panfrost_has_hw_issue(const struct panfrost_device *pfdev,
+ 					 enum panfrost_hw_issue issue)
+ {
