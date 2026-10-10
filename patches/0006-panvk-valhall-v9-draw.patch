@@ -1,0 +1,1003 @@
+Subject: [PATCH] panvk: Valhall v9 on the JM backend, direct draws
+
+Implement CmdDraw and CmdDrawIndexed on v9 with the JM backend by emitting a
+MALLOC_VERTEX_JOB (primitive, tiler, scissor, indices, draw descriptor with
+blend and depth/stencil, position and varying shader environments), modelled
+on gallium's jm_emit_malloc_vertex_job() and panvk's CSF draw code.
+
+Descriptors (vertex attributes, varyings, dynamic buffers, resource tables)
+are built per draw. vkcube renders on Mali-G78 (gs101).
+
+Not implemented yet: indirect draws, layered rendering/multiview, occlusion
+queries, frame-shader loads/resolves, descriptor dirty tracking.
+---
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -54,6 +54,10 @@
+    vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+ }
+ 
++/* 2026-10-10: the CmdDraw/CmdDrawIndexed stubs below are replaced by the real
++ * MALLOC_VERTEX_JOB implementation further down. Kept (disabled) on purpose.
++ */
++#if 0
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
+                         uint32_t instanceCount, uint32_t firstVertex,
+@@ -70,6 +74,975 @@
+ {
+    panvk_v9_jm_gfx_unsupported(commandBuffer);
+ }
++#endif
++
++/* ------------------------------------------------------------------------
++ * Valhall (v9) JM graphics: direct draws through MALLOC_VERTEX_JOB.
++ *
++ * Modelled on the CSF (v10) draw code for descriptors/state and on
++ * gallium's jm_emit_malloc_vertex_job() for the job layout. Not supported
++ * yet: indirect draws, multiview/layered rendering, occlusion queries,
++ * frame-shader loads/resolves.
++ * ------------------------------------------------------------------------ */
++
++static bool
++has_depth_att(struct panvk_cmd_buffer *cmdbuf)
++{
++   return (cmdbuf->state.gfx.render.bound_attachments &
++           MESA_VK_RP_ATTACHMENT_DEPTH_BIT) != 0;
++}
++
++static bool
++has_stencil_att(struct panvk_cmd_buffer *cmdbuf)
++{
++   return (cmdbuf->state.gfx.render.bound_attachments &
++           MESA_VK_RP_ATTACHMENT_STENCIL_BIT) != 0;
++}
++
++static bool
++writes_depth(struct panvk_cmd_buffer *cmdbuf)
++{
++   const struct vk_depth_stencil_state *ds =
++      &cmdbuf->vk.dynamic_graphics_state.ds;
++
++   return has_depth_att(cmdbuf) && ds->depth.test_enable &&
++          ds->depth.write_enable && ds->depth.compare_op != VK_COMPARE_OP_NEVER;
++}
++
++static bool
++writes_stencil(struct panvk_cmd_buffer *cmdbuf)
++{
++   const struct vk_depth_stencil_state *ds =
++      &cmdbuf->vk.dynamic_graphics_state.ds;
++
++   return has_stencil_att(cmdbuf) && ds->stencil.test_enable &&
++          ((ds->stencil.front.write_mask &&
++            (ds->stencil.front.op.fail != VK_STENCIL_OP_KEEP ||
++             ds->stencil.front.op.pass != VK_STENCIL_OP_KEEP ||
++             ds->stencil.front.op.depth_fail != VK_STENCIL_OP_KEEP)) ||
++           (ds->stencil.back.write_mask &&
++            (ds->stencil.back.op.fail != VK_STENCIL_OP_KEEP ||
++             ds->stencil.back.op.pass != VK_STENCIL_OP_KEEP ||
++             ds->stencil.back.op.depth_fail != VK_STENCIL_OP_KEEP)));
++}
++
++static bool
++ds_test_always_passes(struct panvk_cmd_buffer *cmdbuf)
++{
++   const struct vk_depth_stencil_state *ds =
++      &cmdbuf->vk.dynamic_graphics_state.ds;
++
++   if (!has_depth_att(cmdbuf))
++      return true;
++
++   if (ds->depth.test_enable && ds->depth.compare_op != VK_COMPARE_OP_ALWAYS)
++      return false;
++
++   if (ds->stencil.test_enable &&
++       (ds->stencil.front.op.compare != VK_COMPARE_OP_ALWAYS ||
++        ds->stencil.back.op.compare != VK_COMPARE_OP_ALWAYS))
++      return false;
++
++   return true;
++}
++
++static inline enum mali_func
++translate_compare_func(VkCompareOp comp)
++{
++   STATIC_ASSERT(VK_COMPARE_OP_NEVER == (VkCompareOp)MALI_FUNC_NEVER);
++   STATIC_ASSERT(VK_COMPARE_OP_LESS == (VkCompareOp)MALI_FUNC_LESS);
++   STATIC_ASSERT(VK_COMPARE_OP_EQUAL == (VkCompareOp)MALI_FUNC_EQUAL);
++   STATIC_ASSERT(VK_COMPARE_OP_LESS_OR_EQUAL == (VkCompareOp)MALI_FUNC_LEQUAL);
++   STATIC_ASSERT(VK_COMPARE_OP_GREATER == (VkCompareOp)MALI_FUNC_GREATER);
++   STATIC_ASSERT(VK_COMPARE_OP_NOT_EQUAL == (VkCompareOp)MALI_FUNC_NOT_EQUAL);
++   STATIC_ASSERT(VK_COMPARE_OP_GREATER_OR_EQUAL ==
++                 (VkCompareOp)MALI_FUNC_GEQUAL);
++   STATIC_ASSERT(VK_COMPARE_OP_ALWAYS == (VkCompareOp)MALI_FUNC_ALWAYS);
++
++   return (enum mali_func)comp;
++}
++
++static enum mali_stencil_op
++translate_stencil_op(VkStencilOp in)
++{
++   switch (in) {
++   case VK_STENCIL_OP_KEEP:
++      return MALI_STENCIL_OP_KEEP;
++   case VK_STENCIL_OP_ZERO:
++      return MALI_STENCIL_OP_ZERO;
++   case VK_STENCIL_OP_REPLACE:
++      return MALI_STENCIL_OP_REPLACE;
++   case VK_STENCIL_OP_INCREMENT_AND_CLAMP:
++      return MALI_STENCIL_OP_INCR_SAT;
++   case VK_STENCIL_OP_DECREMENT_AND_CLAMP:
++      return MALI_STENCIL_OP_DECR_SAT;
++   case VK_STENCIL_OP_INCREMENT_AND_WRAP:
++      return MALI_STENCIL_OP_INCR_WRAP;
++   case VK_STENCIL_OP_DECREMENT_AND_WRAP:
++      return MALI_STENCIL_OP_DECR_WRAP;
++   case VK_STENCIL_OP_INVERT:
++      return MALI_STENCIL_OP_INVERT;
++   default:
++      UNREACHABLE("Invalid stencil op");
++   }
++}
++
++static enum mali_draw_mode
++translate_prim(enum mesa_prim prim)
++{
++   switch (prim) {
++   case MESA_PRIM_POINTS:
++      return MALI_DRAW_MODE_POINTS;
++   case MESA_PRIM_LINES:
++      return MALI_DRAW_MODE_LINES;
++   case MESA_PRIM_LINE_STRIP:
++      return MALI_DRAW_MODE_LINE_STRIP;
++   case MESA_PRIM_TRIANGLES:
++      return MALI_DRAW_MODE_TRIANGLES;
++   case MESA_PRIM_TRIANGLE_STRIP:
++      return MALI_DRAW_MODE_TRIANGLE_STRIP;
++   case MESA_PRIM_TRIANGLE_FAN:
++      return MALI_DRAW_MODE_TRIANGLE_FAN;
++   case MESA_PRIM_LINES_ADJACENCY:
++      return MALI_DRAW_MODE_LINES_ADJACENCY;
++   case MESA_PRIM_LINE_STRIP_ADJACENCY:
++      return MALI_DRAW_MODE_LINE_STRIP_ADJACENCY;
++   case MESA_PRIM_TRIANGLES_ADJACENCY:
++      return MALI_DRAW_MODE_TRIANGLES_ADJACENCY;
++   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
++      return MALI_DRAW_MODE_TRIANGLE_STRIP_ADJACENCY;
++   default:
++      UNREACHABLE("Invalid primitive type");
++   }
++}
++
++static enum mali_index_type
++index_size_to_index_type(uint32_t size)
++{
++   switch (size) {
++   case 0:
++      return MALI_INDEX_TYPE_NONE;
++   case 1:
++      return MALI_INDEX_TYPE_UINT8;
++   case 2:
++      return MALI_INDEX_TYPE_UINT16;
++   case 4:
++      return MALI_INDEX_TYPE_UINT32;
++   default:
++      assert(!"Invalid index size");
++      return MALI_INDEX_TYPE_NONE;
++   }
++}
++
++static void
++set_provoking_vertex_mode(struct panvk_cmd_buffer *cmdbuf,
++                          enum u_tristate first_provoking_vertex)
++{
++   struct panvk_cmd_graphics_state *state = &cmdbuf->state.gfx;
++
++   if (first_provoking_vertex != U_TRISTATE_UNSET) {
++      assert(state->render.first_provoking_vertex == U_TRISTATE_UNSET ||
++             state->render.first_provoking_vertex == first_provoking_vertex);
++      state->render.first_provoking_vertex = first_provoking_vertex;
++   }
++
++   /* Once the FBD is emitted we must have committed to a mode; the Vulkan
++    * default (first vertex) is the most likely to be right.
++    */
++   if (state->render.first_provoking_vertex == U_TRISTATE_UNSET)
++      state->render.first_provoking_vertex = U_TRISTATE_YES;
++}
++
++static void
++emit_vs_attrib(struct panvk_cmd_buffer *cmdbuf, uint32_t attrib_idx,
++               uint32_t vb_desc_offset, int32_t base_instance,
++               struct mali_attribute_packed *desc)
++{
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_vertex_input_state *vi = dyns->vi;
++   const struct vk_vertex_attribute_state *attrib_info =
++      &vi->attributes[attrib_idx];
++   const struct vk_vertex_binding_state *buf_info =
++      &vi->bindings[attrib_info->binding];
++   const uint32_t stride = dyns->vi_binding_strides[attrib_info->binding];
++   bool per_instance = buf_info->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
++   enum pipe_format f = vk_format_to_pipe_format(attrib_info->format);
++   unsigned buf_idx = vb_desc_offset + attrib_info->binding;
++
++   pan_pack(desc, ATTRIBUTE, cfg) {
++      cfg.offset = attrib_info->offset;
++
++      if (per_instance)
++         cfg.offset += base_instance * stride;
++
++      cfg.format = GENX(pan_format_from_pipe_format)(f)->hw;
++      cfg.table = 0;
++      cfg.buffer_index = buf_idx;
++      cfg.stride = stride;
++      if (!per_instance) {
++         /* Per-vertex */
++         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
++         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
++         cfg.offset_enable = true;
++      } else if (buf_info->divisor == 1) {
++         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
++         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
++      } else if (buf_info->divisor == 0) {
++         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
++         /* HW doesn't support a zero divisor, but we can achieve the same by
++          * not using a divisor and setting the stride to zero */
++         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
++         cfg.stride = 0;
++      } else if (util_is_power_of_two_or_zero(buf_info->divisor)) {
++         /* Per-instance, POT divisor */
++         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
++         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
++         cfg.divisor_r = __builtin_ctz(buf_info->divisor);
++      } else {
++         /* Per-instance, NPOT divisor */
++         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_NPOT_DIVISOR;
++         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
++         cfg.divisor_d = pan_compute_npot_divisor(
++            buf_info->divisor, &cfg.divisor_r, &cfg.divisor_e);
++      }
++   }
++}
++
++static VkResult
++prepare_vs_desc(struct panvk_cmd_buffer *cmdbuf,
++                const struct panvk_draw_info *draw)
++{
++   const struct panvk_shader_desc_info *vs_desc_info =
++      &cmdbuf->state.gfx.vs.shader->desc_info;
++   struct panvk_shader_desc_state *vs_desc_state = &cmdbuf->state.gfx.vs.desc;
++   const struct panvk_descriptor_state *desc_state =
++      &cmdbuf->state.gfx.desc_state;
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_vertex_input_state *vi = dyns->vi;
++
++   uint32_t vb_count = 0;
++   u_foreach_bit(i, vi->attributes_valid)
++      vb_count = MAX2(vi->attributes[i].binding + 1, vb_count);
++
++   uint32_t vb_offset = vs_desc_info->dyn_bufs.count + MAX_VS_ATTRIBS + 1;
++   uint32_t desc_count = vb_offset + vb_count;
++
++   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
++      cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE, PANVK_DESCRIPTOR_SIZE);
++   struct panvk_opaque_desc *descs = driver_set.cpu;
++
++   if (!driver_set.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   for (uint32_t i = 0; i < MAX_VS_ATTRIBS; i++) {
++      if (vi->attributes_valid & BITFIELD_BIT(i)) {
++         emit_vs_attrib(cmdbuf, i, vb_offset, draw->instance.base,
++                        (struct mali_attribute_packed *)(&descs[i]));
++      } else {
++         /* Write a specialized AttributeDescriptor and rely on OOB behavior */
++         pan_cast_and_pack(&descs[i], ATTRIBUTE, cfg) {
++            cfg.table = 17; /* Invalid table, ensuring OOB access */
++            cfg.format = (MALI_R16F << 12) | MALI_RGB_COMPONENT_ORDER_RGBA;
++         }
++      }
++   }
++
++   /* Dummy sampler always comes right after the vertex attribs. */
++   pan_cast_and_pack(&descs[MAX_VS_ATTRIBS], SAMPLER, cfg) {
++      cfg.clamp_integer_array_indices = false;
++   }
++
++   panvk_per_arch(cmd_fill_dyn_bufs)(
++      desc_state, vs_desc_info,
++      (struct mali_buffer_packed *)(&descs[MAX_VS_ATTRIBS + 1]));
++
++   for (uint32_t i = 0; i < vb_count; i++) {
++      const struct panvk_attrib_buf *vb = &cmdbuf->state.gfx.vb.bufs[i];
++      const bool nulldesc = (vb->address == 0 && vb->size == 0);
++
++      if ((vi->bindings_valid & BITFIELD_BIT(i)) && !nulldesc) {
++         pan_cast_and_pack(&descs[vb_offset + i], BUFFER, cfg) {
++            cfg.address = vb->address;
++            cfg.size = vb->size;
++         }
++      } else {
++         /* Write a NullDescriptor and rely on OOB behavior */
++         pan_cast_and_pack(&descs[vb_offset + i], NULL_DESCRIPTOR, cfg)
++            ;
++      }
++   }
++
++   vs_desc_state->driver_set.dev_addr = driver_set.gpu;
++   vs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
++
++   return panvk_per_arch(cmd_prepare_shader_res_table)(
++      cmdbuf, desc_state, vs_desc_info, vs_desc_state, 1);
++}
++
++static void
++emit_varying_descs(const struct panvk_cmd_buffer *cmdbuf,
++                   struct mali_attribute_packed *descs)
++{
++   const struct panvk_shader_variant *vs =
++      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
++   const struct panvk_shader_variant *fs =
++      panvk_shader_only_variant(get_fs(cmdbuf));
++
++   const struct pan_varying_layout *vs_layout = &vs->info.varyings.formats;
++   const struct pan_varying_layout *fs_format = &fs->info.varyings.formats;
++   pan_varying_layout_require_layout(vs_layout);
++   pan_varying_layout_require_format(fs_format);
++
++   for (uint32_t i = 0; i < fs_format->count; i++) {
++      const struct pan_varying_slot *fs_slot =
++         pan_varying_layout_slot_at(fs_format, i);
++
++      /* Skip empty slots and special varyings. */
++      if (!fs_slot || fs_slot->section != PAN_VARYING_SECTION_GENERIC)
++         continue;
++
++      unsigned offset = 0;
++      enum pipe_format format = PIPE_FORMAT_NONE;
++
++      const struct pan_varying_slot *vs_slot =
++         pan_varying_layout_find_slot(vs_layout, fs_slot->location);
++      if (vs_slot) {
++         nir_alu_type base_type = nir_alu_type_get_base_type(fs_slot->alu_type);
++         nir_alu_type bit_size = nir_alu_type_get_type_size(vs_slot->alu_type);
++
++         offset = vs_slot->offset;
++         format = pan_varying_format(base_type | bit_size, vs_slot->ncomps);
++      }
++
++      pan_pack(&descs[i], ATTRIBUTE, cfg) {
++         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_VERTEX_PACKET;
++         cfg.offset_enable = false;
++         cfg.format = GENX(pan_format_from_pipe_format)(format)->hw;
++         cfg.table = 61;
++         cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_VERTEX;
++         cfg.offset = 1024 + offset;
++         cfg.buffer_index = 0;
++         cfg.attribute_stride = vs_layout->generic_size_B;
++         cfg.packet_stride = vs_layout->generic_size_B + 16;
++      }
++   }
++}
++
++static VkResult
++prepare_fs_desc(struct panvk_cmd_buffer *cmdbuf)
++{
++   const struct panvk_shader *fs = get_fs(cmdbuf);
++   struct panvk_shader_desc_state *fs_desc_state = &cmdbuf->state.gfx.fs.desc;
++
++   if (!fs) {
++      memset(fs_desc_state, 0, sizeof(*fs_desc_state));
++      return VK_SUCCESS;
++   }
++
++   const struct panvk_shader_desc_info *fs_desc_info = &fs->desc_info;
++   const struct panvk_descriptor_state *desc_state =
++      &cmdbuf->state.gfx.desc_state;
++
++   /* If the shader is using LD_VAR_BUF[_IMM], we do not have to set up
++    * Attribute Descriptors for varying loads. */
++   const uint32_t desc_count =
++      fs_desc_info->fs_varying_attr_desc_count + fs_desc_info->dyn_bufs.count +
++      1;
++   struct pan_ptr driver_set = panvk_cmd_alloc_dev_mem(
++      cmdbuf, desc, desc_count * PANVK_DESCRIPTOR_SIZE, PANVK_DESCRIPTOR_SIZE);
++   struct panvk_opaque_desc *descs = driver_set.cpu;
++
++   if (desc_count && !driver_set.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   if (fs_desc_info->fs_varying_attr_desc_count > 0)
++      emit_varying_descs(cmdbuf, (struct mali_attribute_packed *)(&descs[0]));
++
++   /* Dummy sampler always comes right after the varyings. */
++   const uint32_t sampler_idx = fs_desc_info->fs_varying_attr_desc_count;
++   pan_cast_and_pack(&descs[sampler_idx], SAMPLER, cfg) {
++      cfg.clamp_integer_array_indices = false;
++   }
++
++   panvk_per_arch(cmd_fill_dyn_bufs)(
++      desc_state, fs_desc_info,
++      (struct mali_buffer_packed *)(&descs[sampler_idx + 1]));
++
++   fs_desc_state->driver_set.dev_addr = driver_set.gpu;
++   fs_desc_state->driver_set.size = desc_count * PANVK_DESCRIPTOR_SIZE;
++
++   return panvk_per_arch(cmd_prepare_shader_res_table)(
++      cmdbuf, desc_state, fs_desc_info, fs_desc_state, 1);
++}
++
++static VkResult
++build_blend(struct panvk_cmd_buffer *cmdbuf,
++            const struct panvk_shader_variant *fs, uint64_t *bds_gpu)
++{
++   uint32_t bd_count = cmdbuf->state.gfx.render.fb.layout.rt_count;
++   struct pan_ptr ptr = panvk_cmd_alloc_desc_array(cmdbuf, bd_count, BLEND);
++   struct mali_blend_packed *bds = ptr.cpu;
++
++   if (bd_count && !ptr.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   if (fs) {
++      VkResult result = panvk_per_arch(blend_emit_descs)(cmdbuf, bds);
++      if (result != VK_SUCCESS)
++         return result;
++   } else {
++      for (unsigned i = 0; i < bd_count; i++) {
++         pan_pack(&bds[i], BLEND, cfg) {
++            cfg.enable = false;
++            cfg.internal.mode = MALI_BLEND_MODE_OFF;
++         }
++      }
++   }
++
++   *bds_gpu = ptr.gpu;
++
++   return VK_SUCCESS;
++}
++
++static VkResult
++build_zsd(struct panvk_cmd_buffer *cmdbuf, uint64_t *zsd_gpu)
++{
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_rasterization_state *rs = &dyns->rs;
++   const struct vk_depth_stencil_state *ds = &dyns->ds;
++   bool test_s = has_stencil_att(cmdbuf) && ds->stencil.test_enable;
++   bool test_z = has_depth_att(cmdbuf) && ds->depth.test_enable;
++   const struct panvk_shader_variant *fs =
++      panvk_shader_only_variant(get_fs(cmdbuf));
++
++   struct pan_ptr zsd = panvk_cmd_alloc_desc(cmdbuf, DEPTH_STENCIL);
++   if (!zsd.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++
++   pan_cast_and_pack(zsd.cpu, DEPTH_STENCIL, cfg) {
++      cfg.stencil_test_enable = test_s;
++      if (test_s) {
++         cfg.front_compare_function =
++            translate_compare_func(ds->stencil.front.op.compare);
++         cfg.front_stencil_fail =
++            translate_stencil_op(ds->stencil.front.op.fail);
++         cfg.front_depth_fail =
++            translate_stencil_op(ds->stencil.front.op.depth_fail);
++         cfg.front_depth_pass = translate_stencil_op(ds->stencil.front.op.pass);
++         cfg.back_compare_function =
++            translate_compare_func(ds->stencil.back.op.compare);
++         cfg.back_stencil_fail = translate_stencil_op(ds->stencil.back.op.fail);
++         cfg.back_depth_fail =
++            translate_stencil_op(ds->stencil.back.op.depth_fail);
++         cfg.back_depth_pass = translate_stencil_op(ds->stencil.back.op.pass);
++      }
++
++      cfg.stencil_from_shader = fs ? fs->info.fs.writes_stencil : 0;
++      cfg.front_write_mask = ds->stencil.front.write_mask;
++      cfg.back_write_mask = ds->stencil.back.write_mask;
++      cfg.front_value_mask = ds->stencil.front.compare_mask;
++      cfg.back_value_mask = ds->stencil.back.compare_mask;
++      cfg.front_reference_value = ds->stencil.front.reference;
++      cfg.back_reference_value = ds->stencil.back.reference;
++
++      cfg.depth_cull_enable = vk_rasterization_state_depth_clip_enable(rs);
++      if (rs->depth_clamp_enable)
++         cfg.depth_clamp_mode = MALI_DEPTH_CLAMP_MODE_BOUNDS;
++
++      if (fs)
++         cfg.depth_source = pan_depth_source(&fs->info);
++
++      cfg.depth_write_enable = test_z && ds->depth.write_enable;
++      cfg.depth_bias_enable = rs->depth_bias.enable;
++      cfg.depth_function = test_z ? translate_compare_func(ds->depth.compare_op)
++                                  : MALI_FUNC_ALWAYS;
++      cfg.depth_units = rs->depth_bias.constant_factor;
++      cfg.depth_factor = rs->depth_bias.slope_factor;
++      cfg.depth_bias_clamp = rs->depth_bias.clamp;
++   }
++
++   *zsd_gpu = zsd.gpu;
++
++   return VK_SUCCESS;
++}
++
++/* The v9 DRAW descriptor has DCD_FLAGS_0 and DCD_FLAGS_1 in its first two
++ * words (no FLAGS_2, that is v10+). They are built packed here and copied over
++ * the first 8 bytes of the DRAW descriptor.
++ */
++struct panvk_dcd_flags {
++   struct mali_dcd_flags_0_packed flags_0;
++   struct mali_dcd_flags_1_packed flags_1;
++};
++
++static void
++build_dcd_flags(struct panvk_cmd_buffer *cmdbuf,
++                const struct panvk_shader_variant *fs,
++                struct panvk_dcd_flags *out)
++{
++   memset(out, 0, sizeof(*out));
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_rasterization_state *rs = &dyns->rs;
++   const struct vk_input_assembly_state *ia = &dyns->ia;
++
++   bool alpha_to_coverage = dyns->ms.alpha_to_coverage_enable;
++   bool writes_z = writes_depth(cmdbuf);
++   bool writes_s = writes_stencil(cmdbuf);
++   bool shader_modifies_coverage = false;
++   uint8_t rt_mask = cmdbuf->state.gfx.render.bound_attachments &
++                     MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
++   uint8_t rt_written = 0, rt_read = 0;
++
++   if (fs) {
++      rt_written = color_attachment_written_mask(fs, &dyns->cal);
++      rt_read = color_attachment_read_mask(fs, &dyns->ial, rt_mask);
++      shader_modifies_coverage = fs->info.fs.writes_coverage ||
++                                 fs->info.fs.can_discard || alpha_to_coverage;
++   }
++
++   bool msaa = dyns->ms.rasterization_samples > 1;
++   enum mesa_prim prim = vk_topology_to_mesa(ia->primitive_topology);
++   enum mesa_prim reduced_prim = u_reduced_prim(prim);
++   if (reduced_prim == MESA_PRIM_LINES &&
++       rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM) {
++      /* Bresenham lines need MSAA disabled. */
++      msaa = false;
++   }
++
++   pan_pack(&out->flags_0, DCD_FLAGS_0, cfg) {
++      if (fs) {
++         enum pan_earlyzs_zs_tilebuf_read zs_read =
++            PAN_EARLYZS_ZS_TILEBUF_NOT_READ;
++
++         if (z_attachment_read(fs, &dyns->ial) ||
++             s_attachment_read(fs, &dyns->ial))
++            zs_read = PAN_EARLYZS_ZS_TILEBUF_READ_NO_OPT;
++
++         bool roa_color =
++            dyns->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
++
++         cfg.allow_forward_pixel_to_kill =
++            fs->info.fs.can_fpk && !(rt_mask & ~rt_written) &&
++            !(rt_read & rt_written) && !alpha_to_coverage &&
++            !cmdbuf->state.gfx.cb.info.any_dest_read && !roa_color;
++
++         cfg.allow_forward_pixel_to_be_killed = !fs->info.writes_global;
++
++         bool writes_zs = writes_z || writes_s;
++         bool zs_always_passes = ds_test_always_passes(cmdbuf);
++         bool oq = cmdbuf->state.gfx.occlusion_query.mode !=
++                   MALI_OCCLUSION_MODE_DISABLED;
++
++         bool roa_zs = dyns->rasterization_order_access &
++                       (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
++
++         if (roa_zs)
++            zs_read = PAN_EARLYZS_ZS_TILEBUF_READ_NO_OPT;
++
++         struct pan_earlyzs_state earlyzs =
++            pan_earlyzs_get(fs->fs.earlyzs_lut, writes_zs || oq,
++                            alpha_to_coverage, zs_always_passes, zs_read);
++
++         cfg.pixel_kill_operation = (enum mali_pixel_kill)earlyzs.kill;
++         cfg.zs_update_operation = (enum mali_pixel_kill)earlyzs.update;
++
++         cfg.evaluate_per_sample = (fs->info.fs.sample_shading ||
++                                    cmdbuf->state.gfx.cb.info.needs_shader) &&
++                                   (dyns->ms.rasterization_samples > 1);
++
++         cfg.shader_modifies_coverage = shader_modifies_coverage;
++      } else {
++         cfg.allow_forward_pixel_to_kill = true;
++         cfg.allow_forward_pixel_to_be_killed = true;
++         cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
++         cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
++         cfg.overdraw_alpha0 = true;
++         cfg.overdraw_alpha1 = true;
++      }
++
++      if (rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM)
++         cfg.aligned_line_ends = true;
++
++      cfg.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
++
++      /* Face culling is polygon state: don't let it discard points/lines. */
++      const bool non_polygon = reduced_prim != MESA_PRIM_TRIANGLES;
++
++      cfg.cull_front_face =
++         !non_polygon && (rs->cull_mode & VK_CULL_MODE_FRONT_BIT) != 0;
++      cfg.cull_back_face =
++         !non_polygon && (rs->cull_mode & VK_CULL_MODE_BACK_BIT) != 0;
++
++      cfg.multisample_enable = msaa;
++      cfg.occlusion_query = cmdbuf->state.gfx.occlusion_query.mode;
++      cfg.alpha_to_coverage = alpha_to_coverage;
++      cfg.scissor_to_bounding_box = true;
++   }
++
++   pan_pack(&out->flags_1, DCD_FLAGS_1, cfg) {
++      cfg.sample_mask = dyns->ms.sample_mask;
++      cfg.render_target_mask = rt_written;
++   }
++}
++
++static void
++emit_scissor(struct panvk_cmd_buffer *cmdbuf, struct mali_scissor_packed *out)
++{
++   const struct vk_viewport_state *vp = &cmdbuf->vk.dynamic_graphics_state.vp;
++
++   /* With rasterizer discard, viewport/scissor may be absent. */
++   if (vp->viewport_count < 1) {
++      memset(out, 0, sizeof(*out));
++      return;
++   }
++
++   const VkViewport *viewport = &vp->viewports[0];
++   const VkRect2D *scissor = &vp->scissors[0];
++
++   pan_pack(out, SCISSOR, cfg) {
++      /* The spec says "width must be greater than 0.0" */
++      assert(viewport->width >= 0);
++      int minx = (int)viewport->x;
++      int maxx = (int)(viewport->x + viewport->width);
++
++      /* Viewport height can be negative */
++      int miny = MIN2((int)viewport->y, (int)(viewport->y + viewport->height));
++      int maxy = MAX2((int)viewport->y, (int)(viewport->y + viewport->height));
++
++      assert(scissor->offset.x >= 0 && scissor->offset.y >= 0);
++      minx = MAX2(scissor->offset.x, minx);
++      miny = MAX2(scissor->offset.y, miny);
++      maxx = MIN2(scissor->offset.x + scissor->extent.width, maxx);
++      maxy = MIN2(scissor->offset.y + scissor->extent.height, maxy);
++
++      /* Make sure we don't end up with a max < min when width/height is 0 */
++      maxx = maxx > minx ? maxx - 1 : maxx;
++      maxy = maxy > miny ? maxy - 1 : maxy;
++
++      cfg.scissor_minimum_x = CLAMP(minx, 0, UINT16_MAX);
++      cfg.scissor_minimum_y = CLAMP(miny, 0, UINT16_MAX);
++      cfg.scissor_maximum_x = CLAMP(maxx, 0, UINT16_MAX);
++      cfg.scissor_maximum_y = CLAMP(maxy, 0, UINT16_MAX);
++   }
++}
++
++static void
++panvk_cmd_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_info *draw)
++{
++   VkResult result;
++   const struct panvk_shader_variant *vs =
++      panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
++
++   /* If there's no vertex shader, we can skip the draw. */
++   if (!vs || !panvk_priv_mem_check_alloc(vs->spds.pos_triangles))
++      return;
++
++   /* Layered/multiview rendering is not implemented for v9 JM yet. */
++   if (cmdbuf->state.gfx.render.layer_count > 1 ||
++       cmdbuf->state.gfx.render.view_mask) {
++      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_FEATURE_NOT_PRESENT);
++      return;
++   }
++
++   /* Needs to be done before get_fs() is called because it depends on
++    * fs.required being initialized. */
++   cmdbuf->state.gfx.fs.required =
++      fs_required(&cmdbuf->state.gfx, &cmdbuf->vk.dynamic_graphics_state);
++
++   const struct panvk_shader_variant *fs =
++      panvk_shader_only_variant(get_fs(cmdbuf));
++   const struct vk_dynamic_graphics_state *dyns =
++      &cmdbuf->vk.dynamic_graphics_state;
++   const struct vk_rasterization_state *rs = &dyns->rs;
++   struct panvk_batch *batch = cmdbuf->cur_batch;
++
++   if (!batch)
++      batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
++
++   /* There are only 16 bits in the descriptor for the job ID. */
++   if (batch->vtc_jc.job_index + 4 >= UINT16_MAX) {
++      panvk_per_arch(cmd_close_batch)(cmdbuf);
++      batch = panvk_per_arch(cmd_open_batch)(cmdbuf);
++   }
++
++   if (cmdbuf->state.gfx.vk_meta) {
++      /* vk_meta doesn't care about the provoking vertex mode, we should use
++       * the same mode that the application uses. */
++      set_provoking_vertex_mode(cmdbuf, U_TRISTATE_UNSET);
++   } else {
++      enum u_tristate first_provoking_vertex = u_tristate_make(
++         rs->provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT);
++      set_provoking_vertex_mode(cmdbuf, first_provoking_vertex);
++   }
++
++   if (!rs->rasterizer_discard_enable) {
++      uint32_t *nr_samples = &cmdbuf->state.gfx.render.fb.nr_samples;
++      uint32_t rasterization_samples = dyns->ms.rasterization_samples;
++
++      /* If there's no attachment, and the FB descriptor hasn't been
++       * allocated yet, we patch nr_samples to match rasterization_samples,
++       * otherwise, we make sure those two numbers match. */
++      if (!batch->fb.desc.gpu && !cmdbuf->state.gfx.render.bound_attachments) {
++         assert(rasterization_samples > 0);
++         *nr_samples = rasterization_samples;
++      } else {
++         assert(rasterization_samples == *nr_samples);
++      }
++
++      result = panvk_per_arch(cmd_alloc_fb_desc)(cmdbuf);
++      if (result != VK_SUCCESS)
++         return;
++   }
++
++   panvk_per_arch(cmd_select_tile_size)(cmdbuf);
++
++   result = panvk_per_arch(cmd_alloc_tls_desc)(cmdbuf, true);
++   if (result != VK_SUCCESS)
++      return;
++
++   batch->tlsinfo.tls.size = MAX3(vs->info.tls_size, fs ? fs->info.tls_size : 0,
++                                  batch->tlsinfo.tls.size);
++
++   /* Descriptors. Re-emitted for every draw: no dirty tracking yet. */
++   struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
++   uint32_t used_set_mask =
++      cmdbuf->state.gfx.vs.shader->desc_info.used_set_mask;
++   if (fs)
++      used_set_mask |= cmdbuf->state.gfx.fs.shader->desc_info.used_set_mask;
++
++   result = panvk_per_arch(cmd_prepare_push_descs)(cmdbuf, desc_state,
++                                                   used_set_mask);
++   if (result != VK_SUCCESS)
++      return;
++
++   result = prepare_vs_desc(cmdbuf, draw);
++   if (result != VK_SUCCESS)
++      return;
++
++   result = prepare_fs_desc(cmdbuf);
++   if (result != VK_SUCCESS)
++      return;
++
++   uint64_t bds_gpu = 0;
++   result = build_blend(cmdbuf, fs, &bds_gpu);
++   if (result != VK_SUCCESS)
++      return;
++
++   uint64_t zsd_gpu = 0;
++   result = build_zsd(cmdbuf, &zsd_gpu);
++   if (result != VK_SUCCESS)
++      return;
++
++   panvk_per_arch(cmd_prepare_draw_sysvals)(cmdbuf, draw, fs);
++
++   struct pan_ptr vs_push_uniforms;
++   result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
++      cmdbuf, vs, &vs_push_uniforms, 1);
++   if (result != VK_SUCCESS)
++      return;
++   cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
++
++   if (fs) {
++      struct pan_ptr fs_push_uniforms;
++      result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
++         cmdbuf, fs, &fs_push_uniforms, 1);
++      if (result != VK_SUCCESS)
++         return;
++      cmdbuf->state.gfx.fs.push_uniforms = fs_push_uniforms.gpu;
++   }
++
++   result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf, 0);
++   if (result != VK_SUCCESS)
++      return;
++
++   struct pan_ptr job = panvk_cmd_alloc_desc(cmdbuf, MALLOC_VERTEX_JOB);
++   if (!job.gpu)
++      return;
++   util_dynarray_append(&batch->jobs, job.cpu);
++
++   const bool secondary_shader = vs->info.vs.secondary_enable && fs != NULL;
++   const bool writes_point_size =
++      vs->info.vs.writes_point_size && draw->prim == MESA_PRIM_POINTS;
++   const bool fs_reads_prim_id = fs ? fs->info.fs.reads_primitive_id : false;
++   const bool writes_prim_id = vs->info.outputs_written & VARYING_BIT_PRIMITIVE_ID;
++   const bool writes_layer = vs->info.outputs_written & VARYING_BIT_LAYER;
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
++      cfg.draw_mode = translate_prim(draw->prim);
++      cfg.index_type = index_size_to_index_type(draw->index.index_size);
++      if (writes_point_size)
++         cfg.point_size_array_format = MALI_POINT_SIZE_ARRAY_FORMAT_FP16;
++      cfg.primitive_index_enable = fs_reads_prim_id;
++      cfg.primitive_index_override = writes_prim_id && fs_reads_prim_id;
++      cfg.allow_rotating_primitives = false;
++      cfg.low_depth_cull = cfg.high_depth_cull =
++         vk_rasterization_state_depth_clip_enable(rs);
++      cfg.secondary_shader = secondary_shader;
++      cfg.primitive_restart = draw->index.restart_enable;
++      cfg.layer_index_enable = writes_layer;
++      /* Valhall uses the base vertex offset for both indexed and
++       * non-indexed draws (gallium does the same). */
++      cfg.base_vertex_offset = draw->vertex.base;
++      cfg.instance_offset = 0;
++      cfg.index_count = draw->vertex.count;
++   }
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, INSTANCE_COUNT, cfg) {
++      cfg.count = draw->instance.count;
++   }
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, ALLOCATION, cfg) {
++      if (secondary_shader) {
++         unsigned sz = vs->info.varyings.formats.generic_size_B;
++         cfg.vertex_packet_stride = sz + 16;
++         cfg.vertex_attribute_stride = sz;
++      } else {
++         /* Hardware requirement for "no varyings" */
++         cfg.vertex_packet_stride = 16;
++         cfg.vertex_attribute_stride = 0;
++      }
++   }
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, TILER, cfg) {
++      cfg.address = batch->tiler.ctx.valhall.desc;
++   }
++
++   emit_scissor(cmdbuf, pan_section_ptr(job.cpu, MALLOC_VERTEX_JOB, SCISSOR));
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, PRIMITIVE_SIZE, cfg) {
++      /* With a point size written by the VS the hardware takes it from the
++       * position packet, otherwise use a fixed size. */
++      if (!writes_point_size) {
++         cfg.fixed_sized = u_reduced_prim(draw->prim) == MESA_PRIM_LINES
++                              ? dyns->rs.line.width
++                              : 1.0f;
++      }
++   }
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, INDICES, cfg) {
++      cfg.address = draw->index.index_size
++                       ? draw->index.buffer_dev_addr +
++                            (uint64_t)draw->index.offset *
++                               draw->index.index_size
++                       : 0;
++   }
++
++   float z_min = 0.0f, z_max = 1.0f;
++   if (dyns->vp.viewport_count >= 1)
++      panvk_depth_range(&cmdbuf->state.gfx, &dyns->vp, &z_min, &z_max);
++
++   struct panvk_dcd_flags dcd_flags;
++   build_dcd_flags(cmdbuf, fs, &dcd_flags);
++
++   struct mali_draw_packed *dcd =
++      pan_section_ptr(job.cpu, MALLOC_VERTEX_JOB, DRAW);
++   pan_pack(dcd, DRAW, cfg) {
++      cfg.vertex_array.packet = true;
++      cfg.minimum_z = z_min;
++      cfg.maximum_z = z_max;
++      cfg.depth_stencil = zsd_gpu;
++      cfg.blend = bds_gpu;
++      cfg.blend_count = cmdbuf->state.gfx.render.fb.layout.rt_count;
++      cfg.occlusion = cmdbuf->state.gfx.occlusion_query.ptr;
++
++      if (fs) {
++         cfg.shader.resources = cmdbuf->state.gfx.fs.desc.res_table;
++         cfg.shader.thread_storage = batch->tls.gpu;
++         cfg.shader.shader = panvk_priv_mem_dev_addr(fs->spd);
++         cfg.shader.fau = cmdbuf->state.gfx.fs.push_uniforms;
++         cfg.shader.fau_count = fs->fau.total_count;
++      }
++   }
++   STATIC_ASSERT(sizeof(dcd_flags.flags_0) == 4 &&
++                 sizeof(dcd_flags.flags_1) == 4);
++   memcpy(dcd, &dcd_flags.flags_0, sizeof(dcd_flags.flags_0));
++   memcpy((uint8_t *)dcd + 4, &dcd_flags.flags_1, sizeof(dcd_flags.flags_1));
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, POSITION, cfg) {
++      cfg.resources = cmdbuf->state.gfx.vs.desc.res_table;
++      cfg.thread_storage = batch->tls.gpu;
++      cfg.shader = draw->prim == MESA_PRIM_POINTS
++                      ? panvk_priv_mem_dev_addr(vs->spds.pos_points)
++                      : panvk_priv_mem_dev_addr(vs->spds.pos_triangles);
++      cfg.fau = cmdbuf->state.gfx.vs.push_uniforms;
++      cfg.fau_count = vs->fau.total_count;
++   }
++
++   pan_section_pack(job.cpu, MALLOC_VERTEX_JOB, VARYING, cfg) {
++      /* The varying shader only feeds the fragment shader. It uses the same
++       * state as the position shader (as gallium does). */
++      if (secondary_shader) {
++         cfg.resources = cmdbuf->state.gfx.vs.desc.res_table;
++         cfg.thread_storage = batch->tls.gpu;
++         cfg.shader = panvk_priv_mem_dev_addr(vs->spds.var);
++         cfg.fau = cmdbuf->state.gfx.vs.push_uniforms;
++         cfg.fau_count = vs->fau.total_count;
++      }
++   }
++
++   pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_MALLOC_VERTEX, false, false, 0,
++                  0, &job, false);
++
++   clear_dirty_after_draw(cmdbuf);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++panvk_per_arch(CmdDraw)(VkCommandBuffer commandBuffer, uint32_t vertexCount,
++                        uint32_t instanceCount, uint32_t firstVertex,
++                        uint32_t firstInstance)
++{
++   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++
++   if (instanceCount == 0 || vertexCount == 0)
++      return;
++
++   /* gl_BaseVertexARB is a signed integer, and it should expose the value of
++    * firstVertex in a non-indexed draw. */
++   assert(firstVertex < INT32_MAX);
++
++   /* gl_BaseInstance is a signed integer, and it should expose the value of
++    * firstInstance. */
++   assert(firstInstance < INT32_MAX);
++
++   struct panvk_draw_info draw = {
++      .vertex.base = firstVertex,
++      .vertex.count = vertexCount,
++      .instance.base = firstInstance,
++      .instance.count = instanceCount,
++      .prim = panvk_get_client_prim(cmdbuf),
++   };
++
++   panvk_cmd_draw(cmdbuf, &draw);
++}
++
++VKAPI_ATTR void VKAPI_CALL
++panvk_per_arch(CmdDrawIndexed)(VkCommandBuffer commandBuffer,
++                               uint32_t indexCount, uint32_t instanceCount,
++                               uint32_t firstIndex, int32_t vertexOffset,
++                               uint32_t firstInstance)
++{
++   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
++
++   if (instanceCount == 0 || indexCount == 0)
++      return;
++
++   assert(firstInstance < INT32_MAX);
++
++   struct panvk_draw_info draw = {
++      .index = panvk_draw_info_index(cmdbuf, firstIndex),
++      .vertex.base = vertexOffset,
++      .vertex.count = indexCount,
++      .instance.count = instanceCount,
++      .instance.base = firstInstance,
++      .prim = panvk_get_client_prim(cmdbuf),
++   };
++
++   panvk_cmd_draw(cmdbuf, &draw);
++}
+ 
+ VKAPI_ATTR void VKAPI_CALL
+ panvk_per_arch(CmdDrawIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buffer,
