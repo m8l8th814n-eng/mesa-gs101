@@ -2,7 +2,8 @@ Patches for Mesa (base: upstream dc330577adb9e98363ef6061e09062f171d0d053, 26.3.
 Apply in order with patch -p1.
 
 0001  Mali-G78 in the panfrost model table (Pixel 6 / gs101)
-0002  Disable transaction elimination on G78 (stale tiles, GPU wedges under a compositor)
-0003  PanVK: Valhall v9 on the JM backend, compute only (no graphics yet)
+0002  Mali-G77 (0x9000) in the panfrost model table
+0003  Disable transaction elimination on G78 (stale tiles, GPU wedges under a compositor)
+0004  PanVK: Valhall v9 on the JM backend, compute only (no graphics yet)
 
-G77 is already in the model table upstream.
+The G77 patch is untested on hardware.
