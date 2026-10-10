@@ -1,0 +1,32 @@
+Subject: [PATCH] panfrost: disable transaction elimination on Mali-G78
+
+Transaction elimination produces stale tiles on Mali-G78 MP20 (gs101).
+Text is the worst affected, being what changes most often between frames,
+and the GPU wedges within seconds under a compositor. PAN_MESA_DEBUG=nocrc
+avoids both, so gate it on a model quirk instead.
+
+The CRC layout constants are correct for arch 9 and G68 shares them, so the
+underlying cause is not the layout. It is not understood yet.
+
+--- a/src/panfrost/model/pan_model.h
++++ b/src/panfrost/model/pan_model.h
+@@ -85,6 +85,7 @@
+        */
+       bool no_hierarchical_tiling;
+       bool max_4x_msaa;
++      bool no_crc;
+    } quirks;
+ };
+ 
+--- a/src/gallium/drivers/panfrost/pan_resource.c
++++ b/src/gallium/drivers/panfrost/pan_resource.c
+@@ -828,6 +828,9 @@
+    unsigned bytes_per_pixel = MAX2(pres->base.nr_samples, 1) *
+                               util_format_get_blocksize(pres->base.format);
+ 
++   if (dev->model->quirks.no_crc)
++      return false;
++
+    return pres->base.bind & PIPE_BIND_RENDER_TARGET && panfrost_is_2d(pres) &&
+           bytes_per_pixel <= bytes_per_pixel_max &&
+           pres->base.last_level == 0 && !(dev->debug & PAN_DBG_NO_CRC);
