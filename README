@@ -10,6 +10,7 @@ patches/ (Mesa, base: upstream dc330577adb9e98363ef6061e09062f171d0d053, 26.3.0_
   0002  Mali-G77 (0x9000) in the panfrost model table Bonus
   0003  Disable transaction elimination on G78
   0004  PanVK: Valhall v9 on the JM backend, compute only (no graphics yet) (G78 + G77)
+  0005  PanVK: v9 clear-only rendering (FBD + fragment job, loadOp = CLEAR verified on G78; draws still stubbed)
 
 
 good luck
